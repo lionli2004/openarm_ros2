@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <fstream>
 #include <thread>
 #include <vector>
 
@@ -24,9 +25,12 @@
 #include "rclcpp/logging.hpp"
 #include "rclcpp/rclcpp.hpp"
 
+#include "ament_index_cpp/get_package_share_directory.hpp"
+
 namespace openarm_hardware {
 
-OpenArm_v10HW::OpenArm_v10HW() = default;
+OpenArm_v10HW::OpenArm_v10HW()
+    : gravity_compensation_enabled_(false), nv_offset_(0) {}
 
 bool OpenArm_v10HW::parse_config(const hardware_interface::HardwareInfo& info) {
   // Parse CAN interface (default: can0)
@@ -60,10 +64,16 @@ bool OpenArm_v10HW::parse_config(const hardware_interface::HardwareInfo& info) {
     can_fd_ = (value == "true");
   }
 
+  // Parse robot description path for gravity compensation (optional)
+  it = info.hardware_parameters.find("robot_description_path");
+  urdf_path_ = (it != info.hardware_parameters.end()) ? it->second : "";
+
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
-              "Configuration: CAN=%s, arm_prefix=%s, hand=%s, can_fd=%s",
+              "Configuration: CAN=%s, arm_prefix=%s, hand=%s, can_fd=%s, "
+              "gravity_compensation=%s",
               can_interface_.c_str(), arm_prefix_.c_str(),
-              hand_ ? "enabled" : "disabled", can_fd_ ? "enabled" : "disabled");
+              hand_ ? "enabled" : "disabled", can_fd_ ? "enabled" : "disabled",
+              urdf_path_.empty() ? "disabled (no urdf)" : "pending");
   return true;
 }
 
@@ -157,6 +167,12 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_configure(
   openarm_->refresh_all();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   openarm_->recv_all();
+
+  // Initialize Pinocchio model for gravity compensation
+  if (!init_pinocchio_model()) {
+    RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                "Gravity compensation disabled — URDF not available");
+  }
 
   return CallbackReturn::SUCCESS;
 }
@@ -257,11 +273,17 @@ hardware_interface::return_type OpenArm_v10HW::read(
 
 hardware_interface::return_type OpenArm_v10HW::write(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
+  // Compute gravity compensation torques if enabled
+  if (gravity_compensation_enabled_) {
+    compute_gravity_torques();
+  }
+
   // Control arm motors with MIT control
   std::vector<openarm::damiao_motor::MITParam> arm_params;
   for (size_t i = 0; i < ARM_DOF; ++i) {
+    double tau_ff = gravity_compensation_enabled_ ? gravity_torques_[i] : 0.0;
     arm_params.push_back({DEFAULT_KP[i], DEFAULT_KD[i], pos_commands_[i],
-                          vel_commands_[i], tau_commands_[i]});
+                          vel_commands_[i], tau_ff});
   }
   openarm_->get_arm().mit_control_all(arm_params);
   // Control gripper if enabled
@@ -273,6 +295,106 @@ hardware_interface::return_type OpenArm_v10HW::write(
   }
   openarm_->recv_all(1000);
   return hardware_interface::return_type::OK;
+}
+
+bool OpenArm_v10HW::init_pinocchio_model() {
+  std::string urdf_path = urdf_path_;
+
+  // Fallback: find URDF via ament_index if not explicitly configured
+  if (urdf_path.empty()) {
+    try {
+      std::string share_dir =
+          ament_index_cpp::get_package_share_directory("openarm_hardware");
+      urdf_path = share_dir + "/openarm.urdf";
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                  "Cannot find openarm_hardware share directory: %s", e.what());
+      return false;
+    }
+  }
+
+  // Check if URDF file exists
+  std::ifstream urdf_file(urdf_path);
+  if (!urdf_file.good()) {
+    RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                "URDF file not found: %s", urdf_path.c_str());
+    return false;
+  }
+
+  RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+              "Loading URDF for gravity compensation: %s", urdf_path.c_str());
+
+  try {
+    pinocchio::urdf::buildModel(urdf_path, pinocchio_model_);
+    pinocchio_data_ = pinocchio::Data(pinocchio_model_);
+    gravity_torques_.resize(ARM_DOF, 0.0);
+
+    // Determine gravity index offset from arm prefix
+    // Bimanual URDF layout: left arm at nv 0..8, right arm at nv 9..17
+    if (arm_prefix_ == "right_") {
+      nv_offset_ = 9;
+    } else {
+      nv_offset_ = 0;  // left_ or empty (single-arm fallback)
+    }
+
+    // Validate: bimanual URDF expects 18 DOF (or 16 without fingers)
+    int expected_dof = nv_offset_ + static_cast<int>(ARM_DOF);
+    if (pinocchio_model_.nv < expected_dof) {
+      RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                  "URDF has %d DOF, need at least %d for arm_prefix='%s'. "
+                  "Trying single-arm mode.",
+                  pinocchio_model_.nv, expected_dof, arm_prefix_.c_str());
+      nv_offset_ = 0;  // fallback to single-arm URDF
+    }
+
+    gravity_compensation_enabled_ = true;
+
+    RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+                "Pinocchio model loaded: %d DOF, nv_offset=%d, "
+                "gravity compensation ENABLED",
+                pinocchio_model_.nv, nv_offset_);
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
+                 "Failed to build Pinocchio model: %s", e.what());
+    gravity_compensation_enabled_ = false;
+    return false;
+  }
+
+  return true;
+}
+
+void OpenArm_v10HW::compute_gravity_torques() {
+  // Build q vector using the full model DOF (e.g. 18 for bimanual, 9 for single-arm)
+  const int nv = pinocchio_model_.nv;
+  Eigen::VectorXd q(nv);
+  q.setZero();
+
+  // Fill arm joint positions at the correct offset for this arm
+  for (size_t i = 0; i < ARM_DOF; ++i) {
+    q[nv_offset_ + i] = pos_states_[i];
+  }
+
+  // Fill finger joints if present (finger joints follow arm joints in the model)
+  if (hand_ && joint_names_.size() > ARM_DOF) {
+    double finger1_rad = pos_states_[ARM_DOF] *
+        (GRIPPER_MOTOR_1_RADIANS / GRIPPER_JOINT_0_POSITION);
+    int finger1_idx = nv_offset_ + static_cast<int>(ARM_DOF);
+    if (finger1_idx < nv) {
+      q[finger1_idx] = finger1_rad;
+    }
+    int finger2_idx = finger1_idx + 1;
+    if (finger2_idx < nv) {
+      q[finger2_idx] = -finger1_rad;  // mimic joint
+    }
+  }
+
+  // Compute gravity torques (full model)
+  pinocchio::computeGeneralizedGravity(pinocchio_model_, pinocchio_data_, q);
+
+  // Extract this arm's gravity torques and convert to motor space
+  for (size_t i = 0; i < ARM_DOF; ++i) {
+    gravity_torques_[i] = pinocchio_data_.g[nv_offset_ + i] / GEAR_RATIOS[i];
+  }
 }
 
 void OpenArm_v10HW::return_to_zero() {

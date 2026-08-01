@@ -18,6 +18,8 @@
 #include <memory>
 #include <openarm/can/socket/openarm.hpp>
 #include <openarm/damiao_motor/dm_motor_constants.hpp>
+#include <pinocchio/algorithm/rnea.hpp>
+#include <pinocchio/parsers/urdf.hpp>
 #include <string>
 #include <vector>
 
@@ -100,11 +102,25 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   const uint32_t DEFAULT_GRIPPER_SEND_CAN_ID = 0x08;
   const uint32_t DEFAULT_GRIPPER_RECV_CAN_ID = 0x18;
 
-  // Default gains
-  const std::vector<double> DEFAULT_KP = {20.0, 20.0, 20.0, 20.0,
-                                          5.0,  5.0,  5.0,  0.5};
-  const std::vector<double> DEFAULT_KD = {2.75, 2.5, 0.7, 0.4,
-                                          0.7,  0.6, 0.5, 0.1};
+  // Default gains (reference: OpenArm doc Kp=200 Nm/rad, Kd=5 Nms/rad,
+  // scaled by motor torque capacity for smaller joints)
+  // Damiao MIT mode: Kp range 0-500, Kd range 0-5
+  const std::vector<double> DEFAULT_KP = {200.0, 200.0, 100.0, 100.0,
+                                          40.0,  40.0,  40.0,  5.0};
+  const std::vector<double> DEFAULT_KD = {5.0,  5.0,  2.5,  2.5,
+                                          1.0,  1.0,  1.0,  0.1};
+
+  // Gear ratios: motor-side revolutions per joint-side revolution
+  // J1/J2 DM8009: 9:1, J3/J4 DM4340: 40:1, J5-J7 DM4310: 10:1
+  const std::vector<double> GEAR_RATIOS = {9.0, 9.0, 40.0, 40.0,
+                                           10.0, 10.0, 10.0};
+
+  // Pinocchio dynamics model for gravity compensation
+  pinocchio::Model pinocchio_model_;
+  pinocchio::Data pinocchio_data_;
+  std::vector<double> gravity_torques_;
+  bool gravity_compensation_enabled_;
+  int nv_offset_;  // index offset into data.g for this arm (0=left, 9=right)
 
   const double GRIPPER_JOINT_0_POSITION = 0.044;
   const double GRIPPER_JOINT_1_POSITION = 0.0;
@@ -116,6 +132,7 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   // Configuration
   std::string can_interface_;
   std::string arm_prefix_;
+  std::string urdf_path_;
   bool hand_;
   bool can_fd_;
 
@@ -137,6 +154,8 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   void return_to_zero();
   bool parse_config(const hardware_interface::HardwareInfo& info);
   void generate_joint_names();
+  bool init_pinocchio_model();
+  void compute_gravity_torques();
 
   // Gripper mapping functions
   double joint_to_motor_radians(double joint_value);

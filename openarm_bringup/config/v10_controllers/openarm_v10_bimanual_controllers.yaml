@@ -99,7 +99,7 @@ left_joint_trajectory_controller:
     allow_partial_joints_goal: false # Defaults to false
     constraints:
       stopped_velocity_tolerance: 0.01 # Defaults to 0.01
-      goal_time: 0.0 # Defaults to 0.0 (start immediately)
+      goal_time: 2.0 # Allow 2s settling time for MIT Kp convergence
 
 left_gripper_controller:
   ros__parameters:
@@ -164,7 +164,7 @@ right_joint_trajectory_controller:
     allow_partial_joints_goal: false # Defaults to false
     constraints:
       stopped_velocity_tolerance: 0.01 # Defaults to 0.01
-      goal_time: 0.0 # Defaults to 0.0 (start immediately)
+      goal_time: 2.0 # Allow 2s settling time for MIT Kp convergence
 
 right_gripper_controller:
   ros__parameters:
