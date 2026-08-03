@@ -102,18 +102,21 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   const uint32_t DEFAULT_GRIPPER_SEND_CAN_ID = 0x08;
   const uint32_t DEFAULT_GRIPPER_RECV_CAN_ID = 0x18;
 
-  // Default gains (reference: OpenArm doc Kp=200 Nm/rad, Kd=5 Nms/rad,
+  // Gains (reference: OpenArm doc Kp=200 Nm/rad, Kd=5 Nms/rad,
   // scaled by motor torque capacity for smaller joints)
   // Damiao MIT mode: Kp range 0-500, Kd range 0-5
-  const std::vector<double> DEFAULT_KP = {200.0, 200.0, 100.0, 100.0,
-                                          40.0,  40.0,  40.0,  5.0};
-  const std::vector<double> DEFAULT_KD = {5.0,  5.0,  2.5,  2.5,
-                                          1.0,  1.0,  1.0,  0.1};
+  // Overridable via hardware parameters kp1..kp7 / kd1..kd7 (official format)
+  std::vector<double> kp_ = {200.0, 200.0, 100.0, 100.0,
+                             40.0,  40.0,  40.0,  5.0};
+  std::vector<double> kd_ = {5.0,  5.0,  2.5,  2.5,
+                             1.0,  1.0,  1.0,  0.1};
 
-  // Gear ratios: motor-side revolutions per joint-side revolution
-  // J1/J2 DM8009: 9:1, J3/J4 DM4340: 40:1, J5-J7 DM4310: 10:1
-  const std::vector<double> GEAR_RATIOS = {9.0, 9.0, 40.0, 40.0,
-                                           10.0, 10.0, 10.0};
+  // NOTE: gear ratios (J1/J2 9:1, J3/J4 40:1, J5-J7 10:1) are intentionally
+  // NOT applied in the control path anymore. Live experiment (2026-08-03):
+  // Damiao MIT-frame q/dq/tau are all output-side units — a +g feedforward of
+  // 6.93 Nm held J2 at 45° with -0.2° drift/5s, while g/9 drifted -41°. The
+  // old /GEAR_RATIOS division weakened gravity compensation 9-40x and caused
+  // the post-trajectory sag ("回掉").
 
   // Pinocchio dynamics model for gravity compensation
   pinocchio::Model pinocchio_model_;
@@ -128,6 +131,9 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   const double GRIPPER_MOTOR_1_RADIANS = -1.0472;
   const double GRIPPER_DEFAULT_KP = 5.0;
   const double GRIPPER_DEFAULT_KD = 0.1;
+  // Overridable via hardware parameters kp_hand / kd_hand
+  double gripper_kp_ = GRIPPER_DEFAULT_KP;
+  double gripper_kd_ = GRIPPER_DEFAULT_KD;
 
   // Configuration
   std::string can_interface_;
@@ -135,6 +141,20 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   std::string urdf_path_;
   bool hand_;
   bool can_fd_;
+
+  // Teaching (drag) mode: low gain + q_des tracks feedback + gravity τ_ff.
+  // Arm can be manually dragged and hovers where released.
+  bool teaching_mode_ = false;
+  // Scale factor applied to kp_/kd_ while teaching (default 0.1 → Kp 20/10/4)
+  double teaching_gain_scale_ = 0.1;
+  // Latched by the runtime estop switch; write() then returns ERROR and
+  // never sends frames again (motors stay disabled).
+  bool estop_triggered_ = false;
+  // URDF position limits (per joint, already including bimanual offsets).
+  // Used as soft limits in teaching mode: in teaching there is no trajectory
+  // controller constraining motion, so the arm must not be dragged past them.
+  std::vector<double> pos_lower_;
+  std::vector<double> pos_upper_;
 
   // OpenArm instance
   std::unique_ptr<openarm::can::socket::OpenArm> openarm_;
@@ -156,6 +176,7 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   void generate_joint_names();
   bool init_pinocchio_model();
   void compute_gravity_torques();
+  bool load_joint_limits();
 
   // Gripper mapping functions
   double joint_to_motor_radians(double joint_value);

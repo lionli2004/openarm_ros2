@@ -37,7 +37,8 @@ def namespace_from_context(context, arm_prefix):
 
 
 def generate_robot_description(context: LaunchContext, description_package, description_file,
-                               arm_type, use_fake_hardware, right_can_interface, left_can_interface):
+                               arm_type, use_fake_hardware, right_can_interface, left_can_interface,
+                               teaching_mode, teaching_gain_scale):
     """Generate robot description using xacro processing."""
 
     description_package_str = context.perform_substitution(description_package)
@@ -46,6 +47,8 @@ def generate_robot_description(context: LaunchContext, description_package, desc
     use_fake_hardware_str = context.perform_substitution(use_fake_hardware)
     right_can_interface_str = context.perform_substitution(right_can_interface)
     left_can_interface_str = context.perform_substitution(left_can_interface)
+    teaching_mode_str = context.perform_substitution(teaching_mode)
+    teaching_gain_scale_str = context.perform_substitution(teaching_gain_scale)
 
     xacro_path = os.path.join(
         get_package_share_directory(description_package_str),
@@ -62,6 +65,8 @@ def generate_robot_description(context: LaunchContext, description_package, desc
             "ros2_control": "true",
             "right_can_interface": right_can_interface_str,
             "left_can_interface": left_can_interface_str,
+            "teaching_mode": teaching_mode_str,
+            "teaching_gain_scale": teaching_gain_scale_str,
         }
     ).toprettyxml(indent="  ")
 
@@ -69,12 +74,14 @@ def generate_robot_description(context: LaunchContext, description_package, desc
 
 
 def robot_nodes_spawner(context: LaunchContext, description_package, description_file,
-                        arm_type, use_fake_hardware, controllers_file, right_can_interface, left_can_interface, arm_prefix):
+                        arm_type, use_fake_hardware, controllers_file, right_can_interface, left_can_interface, arm_prefix,
+                        teaching_mode, teaching_gain_scale):
     """Spawn both robot state publisher and control nodes with shared robot description."""
     namespace = namespace_from_context(context, arm_prefix)
 
     robot_description = generate_robot_description(
         context, description_package, description_file, arm_type, use_fake_hardware, right_can_interface, left_can_interface,
+        teaching_mode, teaching_gain_scale,
     )
 
     controllers_file_str = context.perform_substitution(controllers_file)
@@ -189,6 +196,16 @@ def generate_launch_description():
             default_value="openarm_v10_bimanual_controllers.yaml",
             description="Controllers file(s) to use. Can be a single file or comma-separated list of files.",
         ),
+        DeclareLaunchArgument(
+            "teaching_mode",
+            default_value="false",
+            description="Enable teaching (drag) mode: low gain, q_des tracks feedback, gravity feedforward.",
+        ),
+        DeclareLaunchArgument(
+            "teaching_gain_scale",
+            default_value="0.1",
+            description="Scale factor applied to kp/kd in teaching mode (0, 1].",
+        ),
     ]
 
     # Initialize launch configurations
@@ -202,6 +219,8 @@ def generate_launch_description():
     rightcan_interface = LaunchConfiguration("right_can_interface")
     left_can_interface = LaunchConfiguration("left_can_interface")
     arm_prefix = LaunchConfiguration("arm_prefix")
+    teaching_mode = LaunchConfiguration("teaching_mode")
+    teaching_gain_scale = LaunchConfiguration("teaching_gain_scale")
 
     controllers_file = PathJoinSubstitution(
         [FindPackageShare(runtime_config_package), "config",
@@ -211,11 +230,14 @@ def generate_launch_description():
     robot_nodes_spawner_func = OpaqueFunction(
         function=robot_nodes_spawner,
         args=[description_package, description_file, arm_type,
-              use_fake_hardware, controllers_file, rightcan_interface, left_can_interface, arm_prefix]
+              use_fake_hardware, controllers_file, rightcan_interface, left_can_interface, arm_prefix,
+              teaching_mode, teaching_gain_scale]
     )
 
+    # Use the up-to-date bimanual RViz config from openarm_bringup
+    # (the openarm_description one is outdated and renders incorrectly)
     rviz_config_file = PathJoinSubstitution(
-        [FindPackageShare(description_package), "rviz",
+        [FindPackageShare(runtime_config_package), "rviz",
          "bimanual.rviz"]
     )
 
@@ -225,6 +247,14 @@ def generate_launch_description():
         name="rviz2",
         output="log",
         arguments=["-d", rviz_config_file],
+    )
+
+    # Drag-teaching demo controller (record / replay / mode switch / estop);
+    # the RViz DemoPanel talks to it via services
+    demo_controller_node = Node(
+        package="openarm_demo",
+        executable="demo_controller.py",
+        output="screen",
     )
 
     # Joint state broadcaster spawner
@@ -256,6 +286,20 @@ def generate_launch_description():
         )]
     )
 
+    # Runtime teaching-mode switch controllers (forward_command_controller
+    # writing the gripper effort interface, read by the hardware layer:
+    # >0.5 → teaching, <-0.5 → estop, else startup parameter)
+    teaching_switch_spawner = OpaqueFunction(
+        function=lambda context: [Node(
+            package="controller_manager",
+            executable="spawner",
+            namespace=namespace_from_context(context, arm_prefix),
+            arguments=["left_teaching_switch",
+                       "right_teaching_switch", "-c",
+                       f"/{namespace_from_context(context, arm_prefix)}/controller_manager" if namespace_from_context(context, arm_prefix) else "/controller_manager"],
+        )]
+    )
+
     # Timing and sequencing
     LAUNCH_DELAY_SECONDS = 1.0
     delayed_joint_state_broadcaster = TimerAction(
@@ -272,14 +316,21 @@ def generate_launch_description():
         actions=[gripper_controller_spawner],
     )
 
+    delayed_teaching_switch = TimerAction(
+        period=LAUNCH_DELAY_SECONDS,
+        actions=[teaching_switch_spawner],
+    )
+
     return LaunchDescription(
         declared_arguments + [
             robot_nodes_spawner_func,
             rviz_node,
+            demo_controller_node,
         ] +
         [
             delayed_joint_state_broadcaster,
             delayed_robot_controller,
             delayed_gripper_controller,
+            delayed_teaching_switch,
         ]
     )

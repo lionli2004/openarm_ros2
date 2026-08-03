@@ -1,0 +1,7 @@
+# Request: demo controller status
+---
+bool teaching_mode
+bool recording
+bool replaying
+string trajectory_path
+string message

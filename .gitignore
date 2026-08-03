@@ -1,4 +1,7 @@
 *.swp
 .DS_Store
 .vscode/
+build/
+log/
 __pycache__/
+experiments/teaching/data/

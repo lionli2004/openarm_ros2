@@ -21,11 +21,50 @@
 #include <thread>
 #include <vector>
 
+#include <urdf/model.h>
+
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/logging.hpp"
 #include "rclcpp/rclcpp.hpp"
 
 #include "ament_index_cpp/get_package_share_directory.hpp"
+
+namespace {
+
+// Parse optional double parameter, fall back to default on missing/invalid
+double parse_double_param(const hardware_interface::HardwareInfo& info,
+                          const std::string& name, double default_value,
+                          double min_value, double max_value) {
+  auto it = info.hardware_parameters.find(name);
+  if (it == info.hardware_parameters.end()) return default_value;
+  try {
+    double v = std::stod(it->second);
+    if (v < min_value || v > max_value) {
+      RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                  "Parameter %s = %f out of range [%f, %f], using default %f",
+                  name.c_str(), v, min_value, max_value, default_value);
+      return default_value;
+    }
+    return v;
+  } catch (const std::exception& e) {
+    RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                "Parameter %s invalid ('%s'), using default %f", name.c_str(),
+                it->second.c_str(), default_value);
+    return default_value;
+  }
+}
+
+// Parse optional bool parameter, fall back to default
+bool parse_bool_param(const hardware_interface::HardwareInfo& info,
+                      const std::string& name, bool default_value) {
+  auto it = info.hardware_parameters.find(name);
+  if (it == info.hardware_parameters.end()) return default_value;
+  std::string value = it->second;
+  std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+  return (value == "true");
+}
+
+}  // namespace
 
 namespace openarm_hardware {
 
@@ -43,26 +82,28 @@ bool OpenArm_v10HW::parse_config(const hardware_interface::HardwareInfo& info) {
   arm_prefix_ = (it != info.hardware_parameters.end()) ? it->second : "";
 
   // Parse gripper enable (default: true for V10)
-  it = info.hardware_parameters.find("hand");
-  if (it == info.hardware_parameters.end()) {
-    hand_ = true;  // Default to true for V10
-  } else {
-    // Handle both "true"/"True" and "false"/"False"
-    std::string value = it->second;
-    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-    hand_ = (value == "true");
-  }
+  hand_ = parse_bool_param(info, "hand", true);
 
   // Parse CAN-FD enable (default: true for V10)
-  it = info.hardware_parameters.find("can_fd");
-  if (it == info.hardware_parameters.end()) {
-    can_fd_ = true;  // Default to true for V10
-  } else {
-    // Handle both "true"/"True" and "false"/"False"
-    std::string value = it->second;
-    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-    can_fd_ = (value == "true");
+  can_fd_ = parse_bool_param(info, "can_fd", true);
+
+  // Parse control gains (official kp1..kp7 / kd1..kd7 / kp_hand / kd_hand
+  // format; optional overrides, defaults are the member initializers)
+  for (size_t i = 1; i <= ARM_DOF; ++i) {
+    kp_[i - 1] = parse_double_param(info, "kp" + std::to_string(i), kp_[i - 1],
+                                    0.0, 500.0);  // MIT Kp range
+    kd_[i - 1] = parse_double_param(info, "kd" + std::to_string(i), kd_[i - 1],
+                                    0.0, 5.0);  // MIT Kd range
   }
+  if (hand_) {
+    gripper_kp_ = parse_double_param(info, "kp_hand", gripper_kp_, 0.0, 500.0);
+    gripper_kd_ = parse_double_param(info, "kd_hand", gripper_kd_, 0.0, 5.0);
+  }
+
+  // Parse teaching (drag) mode parameters
+  teaching_mode_ = parse_bool_param(info, "teaching_mode", false);
+  teaching_gain_scale_ =
+      parse_double_param(info, "teaching_gain_scale", 0.1, 0.0, 1.0);
 
   // Parse robot description path for gravity compensation (optional)
   it = info.hardware_parameters.find("robot_description_path");
@@ -70,9 +111,11 @@ bool OpenArm_v10HW::parse_config(const hardware_interface::HardwareInfo& info) {
 
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
               "Configuration: CAN=%s, arm_prefix=%s, hand=%s, can_fd=%s, "
+              "teaching_mode=%s, teaching_gain_scale=%.2f, "
               "gravity_compensation=%s",
               can_interface_.c_str(), arm_prefix_.c_str(),
               hand_ ? "enabled" : "disabled", can_fd_ ? "enabled" : "disabled",
+              teaching_mode_ ? "enabled" : "disabled", teaching_gain_scale_,
               urdf_path_.empty() ? "disabled (no urdf)" : "pending");
   return true;
 }
@@ -127,6 +170,12 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_init(
     return CallbackReturn::ERROR;
   }
 
+  // Position limits are loaded in on_configure() from the same URDF that
+  // Pinocchio uses (so they always match what RViz shows); default to motor
+  // PMAX until then.
+  pos_lower_.resize(joint_names_.size(), -12.5);
+  pos_upper_.resize(joint_names_.size(), 12.5);
+
   // Initialize OpenArm with configurable CAN-FD setting
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
               "Initializing OpenArm on %s with CAN-FD %s...",
@@ -163,6 +212,9 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_init(
 
 hardware_interface::CallbackReturn OpenArm_v10HW::on_configure(
     const rclcpp_lifecycle::State& /*previous_state*/) {
+  // Clear a latched estop on re-configuration (recovery path)
+  estop_triggered_ = false;
+
   // Set callback mode to ignore during configuration
   openarm_->refresh_all();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -174,7 +226,47 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_configure(
                 "Gravity compensation disabled — URDF not available");
   }
 
+  // Load position limits from the same URDF (matches RViz display)
+  load_joint_limits();
+
   return CallbackReturn::SUCCESS;
+}
+
+bool OpenArm_v10HW::load_joint_limits() {
+  std::string urdf_path = urdf_path_;
+  if (urdf_path.empty()) {
+    try {
+      std::string share_dir =
+          ament_index_cpp::get_package_share_directory("openarm_hardware");
+      urdf_path = share_dir + "/openarm.urdf";
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                  "Cannot find openarm_hardware share directory for limits: %s",
+                  e.what());
+      return false;
+    }
+  }
+
+  urdf::Model model;
+  if (!model.initFile(urdf_path)) {
+    RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                "Failed to parse URDF for joint limits: %s", urdf_path.c_str());
+    return false;
+  }
+
+  bool any_found = false;
+  for (size_t i = 0; i < joint_names_.size(); ++i) {
+    auto joint = model.getJoint(joint_names_[i]);
+    if (joint && joint->type == urdf::Joint::REVOLUTE && joint->limits) {
+      pos_lower_[i] = joint->limits->lower;
+      pos_upper_[i] = joint->limits->upper;
+      any_found = true;
+    }
+    RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+                "Joint %s limits: [%.3f, %.3f] rad", joint_names_[i].c_str(),
+                pos_lower_[i], pos_upper_[i]);
+  }
+  return any_found;
 }
 
 std::vector<hardware_interface::StateInterface>
@@ -218,10 +310,15 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_activate(
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   openarm_->recv_all();
 
-  // Return to zero position
-  return_to_zero();
+  // Return to zero unless teaching mode: in teaching the arm must keep its
+  // current pose so it can be dragged from wherever it is.
+  if (!teaching_mode_) {
+    return_to_zero();
+  }
 
-  RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"), "OpenArm V10 activated");
+  RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+              "OpenArm V10 activated (teaching_mode=%s, gain_scale=%.2f)",
+              teaching_mode_ ? "true" : "false", teaching_gain_scale_);
   return CallbackReturn::SUCCESS;
 }
 
@@ -230,10 +327,13 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_deactivate(
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
               "Deactivating OpenArm V10...");
 
-  // Disable all motors (like full_arm.cpp exit)
-  openarm_->disable_all();
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  openarm_->recv_all();
+  // Disable all motors; repeat to make sure the commands reach the bus
+  // (official behavior)
+  for (int i = 0; i < 3; ++i) {
+    openarm_->disable_all();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    openarm_->recv_all();
+  }
 
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"), "OpenArm V10 deactivated");
   return CallbackReturn::SUCCESS;
@@ -273,17 +373,72 @@ hardware_interface::return_type OpenArm_v10HW::read(
 
 hardware_interface::return_type OpenArm_v10HW::write(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
+  // Latched emergency stop: once triggered, never send frames again
+  // (motors stay disabled until re-activation).
+  if (estop_triggered_) {
+    return hardware_interface::return_type::ERROR;
+  }
+
+  // Runtime mode switch via the (otherwise unused) gripper effort command
+  // interface, written by a forward_command_controller from the demo
+  // front-end:  >0.5 → teaching (drag), <-0.5 → emergency disable,
+  //              otherwise → startup parameter teaching_mode_.
+  bool teaching_now = teaching_mode_;
+  if (hand_ && joint_names_.size() > ARM_DOF) {
+    const double sw = tau_commands_[ARM_DOF];
+    if (sw > 0.5) {
+      teaching_now = true;
+    } else if (sw < -0.5) {
+      RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
+                   "ESTOP via gripper-effort switch — disabling motors");
+      estop_triggered_ = true;
+      openarm_->disable_all();
+      return hardware_interface::return_type::ERROR;
+    }
+  }
+
   // Compute gravity compensation torques if enabled
   if (gravity_compensation_enabled_) {
     compute_gravity_torques();
   }
 
+  // Teaching mode has no trajectory controller constraining motion: enforce
+  // soft position limits here and disable the motors if violated (e.g. the
+  // operator drags the arm into a limit).
+  // A small deadband absorbs feedback quantization noise. Observed live:
+  //   - right J4 at q=-0.000 tripped the lower limit 0.0 (zero pose == lower
+  //     limit; a -1e-4 reading noise spike disabled the arm)
+  //   - left J3 at q=1.573 tripped the upper limit 1.571 (0.1° overshoot)
+  // 0.01 rad (0.57°) is well above the noise (~0.001) and still far from
+  // any mechanical stop; the URDF limits themselves stay authoritative.
+  if (teaching_now) {
+    static constexpr double kLimitDeadband = 0.01;
+    for (size_t i = 0; i < ARM_DOF && i < pos_lower_.size(); ++i) {
+      if (pos_states_[i] < pos_lower_[i] - kLimitDeadband ||
+          pos_states_[i] > pos_upper_[i] + kLimitDeadband) {
+        RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
+                     "TEACHING LIMIT VIOLATION %s: q=%.3f outside [%.3f, %.3f]"
+                     " (deadband %.3f) — disabling motors",
+                     joint_names_[i].c_str(), pos_states_[i], pos_lower_[i],
+                     pos_upper_[i], kLimitDeadband);
+        openarm_->disable_all();
+        return hardware_interface::return_type::ERROR;
+      }
+    }
+  }
+
   // Control arm motors with MIT control
   std::vector<openarm::damiao_motor::MITParam> arm_params;
   for (size_t i = 0; i < ARM_DOF; ++i) {
+    double gain_scale = teaching_now ? teaching_gain_scale_ : 1.0;
+    // In teaching mode, track the measured position so the position loop
+    // never fights the operator; the velocity command is zeroed likewise.
+    // τ_ff stays gravity compensation, which makes the arm hover.
+    double q_des = teaching_now ? pos_states_[i] : pos_commands_[i];
+    double dq_des = teaching_now ? 0.0 : vel_commands_[i];
     double tau_ff = gravity_compensation_enabled_ ? gravity_torques_[i] : 0.0;
-    arm_params.push_back({DEFAULT_KP[i], DEFAULT_KD[i], pos_commands_[i],
-                          vel_commands_[i], tau_ff});
+    arm_params.push_back({kp_[i] * gain_scale, kd_[i] * gain_scale, q_des,
+                          dq_des, tau_ff});
   }
   openarm_->get_arm().mit_control_all(arm_params);
   // Control gripper if enabled
@@ -291,9 +446,9 @@ hardware_interface::return_type OpenArm_v10HW::write(
     // TODO the true mappings are unimplemented.
     double motor_command = joint_to_motor_radians(pos_commands_[ARM_DOF]);
     openarm_->get_gripper().mit_control_all(
-        {{GRIPPER_DEFAULT_KP, GRIPPER_DEFAULT_KD, motor_command, 0, 0}});
+        {{gripper_kp_, gripper_kd_, motor_command, 0, 0}});
   }
-  openarm_->recv_all(1000);
+  openarm_->recv_all(100);
   return hardware_interface::return_type::OK;
 }
 
@@ -391,31 +546,59 @@ void OpenArm_v10HW::compute_gravity_torques() {
   // Compute gravity torques (full model)
   pinocchio::computeGeneralizedGravity(pinocchio_model_, pinocchio_data_, q);
 
-  // Extract this arm's gravity torques and convert to motor space
+  // Extract this arm's gravity torques.
+  // NOTE (2026-08-03, live experiment): the Damiao MIT-frame q/dq/tau fields
+  // are ALL in output-side units (motor TMAX values are output-side Nm, and a
+  // +g feedforward of 6.93 Nm held J2 at 45° with only -0.2° drift in 5 s,
+  // while g/9 drifted -41°). Dividing by GEAR_RATIOS weakened the gravity
+  // compensation 9-40x — that was the root cause of the post-trajectory sag
+  // ("回掉"). Feedforward must NOT be divided.
   for (size_t i = 0; i < ARM_DOF; ++i) {
-    gravity_torques_[i] = pinocchio_data_.g[nv_offset_ + i] / GEAR_RATIOS[i];
+    gravity_torques_[i] = pinocchio_data_.g[nv_offset_ + i];
   }
 }
 
 void OpenArm_v10HW::return_to_zero() {
   RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
-              "Returning to zero position...");
+              "Returning to zero position (interpolated)...");
 
-  // Return arm to zero with MIT control
+  // Send an immediate zero-position command and read the actual starting
+  // position, then ramp linearly so the arm moves smoothly from wherever it
+  // currently is (official behavior: 200 steps x 10 ms, ~2 s total).
   std::vector<openarm::damiao_motor::MITParam> arm_params;
   for (size_t i = 0; i < ARM_DOF; ++i) {
-    arm_params.push_back({DEFAULT_KP[i], DEFAULT_KD[i], 0.0, 0.0, 0.0});
+    arm_params.push_back({kp_[i], kd_[i], 0.0, 0.0, 0.0});
   }
   openarm_->get_arm().mit_control_all(arm_params);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  openarm_->recv_all();
+
+  const auto& arm_motors = openarm_->get_arm().get_motors();
+  std::vector<double> start(ARM_DOF, 0.0);
+  for (size_t i = 0; i < ARM_DOF; ++i) {
+    start[i] = arm_motors[i].get_position();
+  }
+
+  constexpr int kNumSteps = 200;
+  constexpr int kStepMs = 10;
+  for (int step = 1; step <= kNumSteps; ++step) {
+    double t = static_cast<double>(step) / kNumSteps;
+    for (size_t i = 0; i < ARM_DOF; ++i) {
+      double target = start[i] + t * (0.0 - start[i]);
+      arm_params[i] = {kp_[i], kd_[i], target, 0.0, 0.0};
+    }
+    openarm_->get_arm().mit_control_all(arm_params);
+    std::this_thread::sleep_for(std::chrono::milliseconds(kStepMs));
+    openarm_->recv_all();
+  }
 
   // Return gripper to zero if enabled
   if (hand_) {
     openarm_->get_gripper().mit_control_all(
-        {{GRIPPER_DEFAULT_KP, GRIPPER_DEFAULT_KD, GRIPPER_JOINT_0_POSITION, 0.0,
-          0.0}});
+        {{gripper_kp_, gripper_kd_, GRIPPER_JOINT_0_POSITION, 0.0, 0.0}});
+    std::this_thread::sleep_for(std::chrono::microseconds(1000));
+    openarm_->recv_all();
   }
-  std::this_thread::sleep_for(std::chrono::microseconds(1000));
-  openarm_->recv_all();
 }
 
 // Gripper mapping helper functions

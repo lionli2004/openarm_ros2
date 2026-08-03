@@ -44,6 +44,33 @@ controller_manager:
     right_gripper_controller:
       type: position_controllers/GripperActionController
 
+    left_teaching_switch:
+      type: forward_command_controller/ForwardCommandController
+
+    right_teaching_switch:
+      type: forward_command_controller/ForwardCommandController
+
+
+left_teaching_switch:
+  ros__parameters:
+    joints:
+      - openarm_left_finger_joint1
+    interface_name: effort
+    command_interfaces:
+      - effort
+    state_interfaces:
+      - effort
+
+right_teaching_switch:
+  ros__parameters:
+    joints:
+      - openarm_right_finger_joint1
+    interface_name: effort
+    command_interfaces:
+      - effort
+    state_interfaces:
+      - effort
+
 
 left_forward_position_controller:
   ros__parameters:

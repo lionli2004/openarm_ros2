@@ -41,6 +41,8 @@ Panels:
     Name: Time
     SyncMode: 0
     SyncSource: ""
+  - Class: openarm_demo/DemoPanel
+    Name: DemoPanel
 Visualization Manager:
   Class: ""
   Displays:

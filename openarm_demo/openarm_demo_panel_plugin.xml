@@ -1,0 +1,5 @@
+<library path="libopenarm_demo_panel">
+  <class name="openarm_demo/DemoPanel" type="openarm_demo::DemoPanel" base_class_type="rviz_common::Panel">
+    <description>OpenArm drag-teaching demo controls (record, replay, mode switch, estop).</description>
+  </class>
+</library>

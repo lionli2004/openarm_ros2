@@ -1,0 +1,6 @@
+# Request: replay a recorded drag-teaching trajectory
+string path       # CSV path; empty = last recorded trajectory
+float32 speed     # playback speed multiplier (0.1 - 5.0)
+---
+bool success
+string message
