@@ -38,7 +38,8 @@ def namespace_from_context(context, arm_prefix):
 
 def generate_robot_description(context: LaunchContext, description_package, description_file,
                                arm_type, use_fake_hardware, right_can_interface, left_can_interface,
-                               teaching_mode, teaching_gain_scale):
+                               teaching_mode, teaching_gain_scale,
+                               left_calib_file, right_calib_file):
     """Generate robot description using xacro processing."""
 
     description_package_str = context.perform_substitution(description_package)
@@ -49,6 +50,8 @@ def generate_robot_description(context: LaunchContext, description_package, desc
     left_can_interface_str = context.perform_substitution(left_can_interface)
     teaching_mode_str = context.perform_substitution(teaching_mode)
     teaching_gain_scale_str = context.perform_substitution(teaching_gain_scale)
+    left_calib_file_str = context.perform_substitution(left_calib_file)
+    right_calib_file_str = context.perform_substitution(right_calib_file)
 
     xacro_path = os.path.join(
         get_package_share_directory(description_package_str),
@@ -67,6 +70,8 @@ def generate_robot_description(context: LaunchContext, description_package, desc
             "left_can_interface": left_can_interface_str,
             "teaching_mode": teaching_mode_str,
             "teaching_gain_scale": teaching_gain_scale_str,
+            "left_calib_file": left_calib_file_str,
+            "right_calib_file": right_calib_file_str,
         }
     ).toprettyxml(indent="  ")
 
@@ -75,13 +80,13 @@ def generate_robot_description(context: LaunchContext, description_package, desc
 
 def robot_nodes_spawner(context: LaunchContext, description_package, description_file,
                         arm_type, use_fake_hardware, controllers_file, right_can_interface, left_can_interface, arm_prefix,
-                        teaching_mode, teaching_gain_scale):
+                        teaching_mode, teaching_gain_scale, left_calib_file, right_calib_file):
     """Spawn both robot state publisher and control nodes with shared robot description."""
     namespace = namespace_from_context(context, arm_prefix)
 
     robot_description = generate_robot_description(
         context, description_package, description_file, arm_type, use_fake_hardware, right_can_interface, left_can_interface,
-        teaching_mode, teaching_gain_scale,
+        teaching_mode, teaching_gain_scale, left_calib_file, right_calib_file,
     )
 
     controllers_file_str = context.perform_substitution(controllers_file)
@@ -206,6 +211,16 @@ def generate_launch_description():
             default_value="0.1",
             description="Scale factor applied to kp/kd in teaching mode (0, 1].",
         ),
+        DeclareLaunchArgument(
+            "left_calib_file",
+            default_value="",
+            description="Calibration file for the left arm (gravity scale + friction).",
+        ),
+        DeclareLaunchArgument(
+            "right_calib_file",
+            default_value="",
+            description="Calibration file for the right arm (gravity scale + friction).",
+        ),
     ]
 
     # Initialize launch configurations
@@ -221,6 +236,8 @@ def generate_launch_description():
     arm_prefix = LaunchConfiguration("arm_prefix")
     teaching_mode = LaunchConfiguration("teaching_mode")
     teaching_gain_scale = LaunchConfiguration("teaching_gain_scale")
+    left_calib_file = LaunchConfiguration("left_calib_file")
+    right_calib_file = LaunchConfiguration("right_calib_file")
 
     controllers_file = PathJoinSubstitution(
         [FindPackageShare(runtime_config_package), "config",
@@ -231,7 +248,7 @@ def generate_launch_description():
         function=robot_nodes_spawner,
         args=[description_package, description_file, arm_type,
               use_fake_hardware, controllers_file, rightcan_interface, left_can_interface, arm_prefix,
-              teaching_mode, teaching_gain_scale]
+              teaching_mode, teaching_gain_scale, left_calib_file, right_calib_file]
     )
 
     # Use the up-to-date bimanual RViz config from openarm_bringup

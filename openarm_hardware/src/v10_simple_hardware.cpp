@@ -18,6 +18,7 @@
 #include <cctype>
 #include <chrono>
 #include <fstream>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -104,6 +105,11 @@ bool OpenArm_v10HW::parse_config(const hardware_interface::HardwareInfo& info) {
   teaching_mode_ = parse_bool_param(info, "teaching_mode", false);
   teaching_gain_scale_ =
       parse_double_param(info, "teaching_gain_scale", 0.1, 0.0, 1.0);
+
+  // Calibration file (per-joint gravity scale + friction feedforward).
+  // Loaded during on_configure(); empty → uncalibrated defaults.
+  it = info.hardware_parameters.find("calib_file");
+  calib_file_ = (it != info.hardware_parameters.end()) ? it->second : "";
 
   // Parse robot description path for gravity compensation (optional)
   it = info.hardware_parameters.find("robot_description_path");
@@ -228,6 +234,25 @@ hardware_interface::CallbackReturn OpenArm_v10HW::on_configure(
 
   // Load position limits from the same URDF (matches RViz display)
   load_joint_limits();
+
+  // Load per-joint calibration (gravity scale + friction feedforward).
+  // Uncalibrated defaults (grav_k=1, no friction) reproduce current behaviour.
+  friction_comp_enabled_ = false;
+  if (!calib_file_.empty()) {
+    CalibParams loaded;
+    if (parse_calib_file(calib_file_, loaded)) {
+      calib_ = loaded;
+      friction_comp_enabled_ = (calib_.fric_scale > 0.0);
+      friction_torques_.resize(ARM_DOF, 0.0);
+      RCLCPP_INFO(rclcpp::get_logger("OpenArm_v10HW"),
+                  "Calibration loaded: %s (friction FF %s)", calib_file_.c_str(),
+                  friction_comp_enabled_ ? "enabled" : "disabled");
+    } else {
+      RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                  "Failed to parse calibration file %s — using defaults",
+                  calib_file_.c_str());
+    }
+  }
 
   return CallbackReturn::SUCCESS;
 }
@@ -383,11 +408,11 @@ hardware_interface::return_type OpenArm_v10HW::write(
   // interface, written by a forward_command_controller from the demo
   // front-end:  >0.5 → teaching (drag), <-0.5 → emergency disable,
   //              otherwise → startup parameter teaching_mode_.
-  bool teaching_now = teaching_mode_;
+  teaching_now_ = teaching_mode_;
   if (hand_ && joint_names_.size() > ARM_DOF) {
     const double sw = tau_commands_[ARM_DOF];
     if (sw > 0.5) {
-      teaching_now = true;
+      teaching_now_ = true;
     } else if (sw < -0.5) {
       RCLCPP_ERROR(rclcpp::get_logger("OpenArm_v10HW"),
                    "ESTOP via gripper-effort switch — disabling motors");
@@ -401,6 +426,10 @@ hardware_interface::return_type OpenArm_v10HW::write(
   if (gravity_compensation_enabled_) {
     compute_gravity_torques();
   }
+  // Compute friction feedforward if calibrated (uses teaching_now_)
+  if (friction_comp_enabled_) {
+    compute_friction_ff();
+  }
 
   // Teaching mode has no trajectory controller constraining motion: enforce
   // soft position limits here and disable the motors if violated (e.g. the
@@ -411,7 +440,7 @@ hardware_interface::return_type OpenArm_v10HW::write(
   //   - left J3 at q=1.573 tripped the upper limit 1.571 (0.1° overshoot)
   // 0.01 rad (0.57°) is well above the noise (~0.001) and still far from
   // any mechanical stop; the URDF limits themselves stay authoritative.
-  if (teaching_now) {
+  if (teaching_now_) {
     static constexpr double kLimitDeadband = 0.01;
     for (size_t i = 0; i < ARM_DOF && i < pos_lower_.size(); ++i) {
       if (pos_states_[i] < pos_lower_[i] - kLimitDeadband ||
@@ -430,13 +459,24 @@ hardware_interface::return_type OpenArm_v10HW::write(
   // Control arm motors with MIT control
   std::vector<openarm::damiao_motor::MITParam> arm_params;
   for (size_t i = 0; i < ARM_DOF; ++i) {
-    double gain_scale = teaching_now ? teaching_gain_scale_ : 1.0;
+    double gain_scale = teaching_now_ ? teaching_gain_scale_ : 1.0;
     // In teaching mode, track the measured position so the position loop
     // never fights the operator; the velocity command is zeroed likewise.
-    // τ_ff stays gravity compensation, which makes the arm hover.
-    double q_des = teaching_now ? pos_states_[i] : pos_commands_[i];
-    double dq_des = teaching_now ? 0.0 : vel_commands_[i];
-    double tau_ff = gravity_compensation_enabled_ ? gravity_torques_[i] : 0.0;
+    double q_des = teaching_now_ ? pos_states_[i] : pos_commands_[i];
+    double dq_des = teaching_now_ ? 0.0 : vel_commands_[i];
+    // τ_ff = scaled gravity + friction feedforward + external effort
+    // injection (calibration ramps / future force control; 0 in production).
+    // Clamped to ±0.5·tMax so no single feedforward term can overpower the
+    // motor.
+    double tau_ff = 0.0;
+    if (gravity_compensation_enabled_) {
+      tau_ff += calib_.joints[i].grav_k * gravity_torques_[i];
+    }
+    if (friction_comp_enabled_) {
+      tau_ff += friction_torques_[i];
+    }
+    tau_ff += tau_commands_[i];
+    tau_ff = std::clamp(tau_ff, -0.5 * kTMax_[i], 0.5 * kTMax_[i]);
     arm_params.push_back({kp_[i] * gain_scale, kd_[i] * gain_scale, q_des,
                           dq_des, tau_ff});
   }
@@ -599,6 +639,83 @@ void OpenArm_v10HW::return_to_zero() {
     std::this_thread::sleep_for(std::chrono::microseconds(1000));
     openarm_->recv_all();
   }
+}
+
+void OpenArm_v10HW::compute_friction_ff() {
+  // Coulomb + viscous feedforward, direction-asymmetric:
+  //   τ_ff = η · (τ_c± · tanh(dq/ε) + B± · dq)
+  // η < 1 guarantees the feedforward never exceeds the actual friction
+  // (tanh ≤ 1 ⇒ η·τ_c < τ_c), so no self-excited motion can build up.
+  // Teaching mode: dead zone below teach_deadzone (operator must overcome
+  // the full static threshold — physical limit) with a linear blend out of
+  // the zone; hover (dq=0) is completely unaffected.
+  for (size_t i = 0; i < ARM_DOF; ++i) {
+    const double dq = vel_states_[i];
+    const auto& p = calib_.joints[i];
+    if (teaching_now_ && std::abs(dq) < calib_.teach_deadzone) {
+      friction_torques_[i] = 0.0;
+      continue;
+    }
+    const double tc = (dq >= 0) ? p.tau_c_plus : p.tau_c_minus;
+    const double b = (dq >= 0) ? p.b_plus : p.b_minus;
+    double ff = tc * std::tanh(dq / p.eps) + b * dq;
+    double scale = teaching_now_ ? calib_.teach_scale : calib_.fric_scale;
+    if (teaching_now_) {
+      // linear blend from dead zone edge to full value over [dz, 2·dz]
+      const double a = std::abs(dq);
+      if (a < 2.0 * calib_.teach_deadzone) {
+        ff *= (a - calib_.teach_deadzone) / calib_.teach_deadzone;
+      }
+    }
+    friction_torques_[i] = scale * ff;
+  }
+}
+
+bool OpenArm_v10HW::parse_calib_file(const std::string& path,
+                                     CalibParams& out) {
+  std::ifstream file(path);
+  if (!file.good()) {
+    return false;
+  }
+  std::string line;
+  bool ok = true;
+  while (std::getline(file, line)) {
+    // strip comments and trim
+    auto hash = line.find('#');
+    if (hash != std::string::npos) line = line.substr(0, hash);
+    std::istringstream iss(line);
+    std::string key;
+    if (!(iss >> key) || key.empty()) continue;
+    std::vector<double> vals;
+    double v;
+    while (iss >> v) vals.push_back(v);
+
+    if (key == "grav_k" && vals.size() == ARM_DOF) {
+      for (size_t i = 0; i < ARM_DOF; ++i) out.joints[i].grav_k = vals[i];
+    } else if (key == "tau_c_plus" && vals.size() == ARM_DOF) {
+      for (size_t i = 0; i < ARM_DOF; ++i) out.joints[i].tau_c_plus = vals[i];
+    } else if (key == "tau_c_minus" && vals.size() == ARM_DOF) {
+      for (size_t i = 0; i < ARM_DOF; ++i) out.joints[i].tau_c_minus = vals[i];
+    } else if (key == "b_plus" && vals.size() == ARM_DOF) {
+      for (size_t i = 0; i < ARM_DOF; ++i) out.joints[i].b_plus = vals[i];
+    } else if (key == "b_minus" && vals.size() == ARM_DOF) {
+      for (size_t i = 0; i < ARM_DOF; ++i) out.joints[i].b_minus = vals[i];
+    } else if (key == "eps" && vals.size() == ARM_DOF) {
+      for (size_t i = 0; i < ARM_DOF; ++i) out.joints[i].eps = vals[i];
+    } else if (key == "fric_scale" && vals.size() == 1) {
+      out.fric_scale = vals[0];
+    } else if (key == "teach_scale" && vals.size() == 1) {
+      out.teach_scale = vals[0];
+    } else if (key == "teach_deadzone" && vals.size() == 1) {
+      out.teach_deadzone = vals[0];
+    } else if (!key.empty()) {
+      RCLCPP_WARN(rclcpp::get_logger("OpenArm_v10HW"),
+                  "calib file: ignoring unknown/malformed line: %s",
+                  line.c_str());
+      ok = false;
+    }
+  }
+  return ok;
 }
 
 // Gripper mapping helper functions

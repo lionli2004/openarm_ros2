@@ -50,6 +50,12 @@ controller_manager:
     right_teaching_switch:
       type: forward_command_controller/ForwardCommandController
 
+    left_calib_tau:
+      type: forward_command_controller/ForwardCommandController
+
+    right_calib_tau:
+      type: forward_command_controller/ForwardCommandController
+
 
 left_teaching_switch:
   ros__parameters:
@@ -65,6 +71,43 @@ right_teaching_switch:
   ros__parameters:
     joints:
       - openarm_right_finger_joint1
+    interface_name: effort
+    command_interfaces:
+      - effort
+    state_interfaces:
+      - effort
+
+
+# Calibration-only τ_ff injection (7 arm joints' effort interface → hardware
+# write() adds tau_commands_[i] to τ_ff). NOT spawned in production; spawn
+# manually during calibration:
+#   ros2 run controller_manager spawner left_calib_tau right_calib_tau -c /controller_manager
+left_calib_tau:
+  ros__parameters:
+    joints:
+      - openarm_left_joint1
+      - openarm_left_joint2
+      - openarm_left_joint3
+      - openarm_left_joint4
+      - openarm_left_joint5
+      - openarm_left_joint6
+      - openarm_left_joint7
+    interface_name: effort
+    command_interfaces:
+      - effort
+    state_interfaces:
+      - effort
+
+right_calib_tau:
+  ros__parameters:
+    joints:
+      - openarm_right_joint1
+      - openarm_right_joint2
+      - openarm_right_joint3
+      - openarm_right_joint4
+      - openarm_right_joint5
+      - openarm_right_joint6
+      - openarm_right_joint7
     interface_name: effort
     command_interfaces:
       - effort

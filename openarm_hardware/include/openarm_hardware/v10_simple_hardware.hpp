@@ -150,6 +150,36 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   // Latched by the runtime estop switch; write() then returns ERROR and
   // never sends frames again (motors stay disabled).
   bool estop_triggered_ = false;
+  // Effective teaching state for the current write() cycle (runtime switch
+  // or startup parameter) — member so compute_friction_ff() can see it.
+  bool teaching_now_ = false;
+
+  // Per-joint calibration / compensation parameters (output-side units,
+  // consistent with the MIT frame). Loaded from a text file via the
+  // `calib_file` hardware parameter; defaults reproduce the uncalibrated
+  // behaviour (grav_k=1, no friction feedforward).
+  struct JointCalibParams {
+    double grav_k = 1.0;        // gravity model scale
+    double tau_c_plus = 0.0;    // Nm, Coulomb (dq >= 0)
+    double tau_c_minus = 0.0;   // Nm, Coulomb (dq < 0)
+    double b_plus = 0.0;        // Nm/(rad/s), viscous (dq >= 0)
+    double b_minus = 0.0;       // Nm/(rad/s), viscous (dq < 0)
+    double eps = 0.02;          // rad/s, tanh smoothing
+  };
+  struct CalibParams {
+    double fric_scale = 0.8;    // eta, normal mode (under-compensation)
+    double teach_scale = 0.6;   // eta, teaching mode (conservative)
+    double teach_deadzone = 0.03;  // rad/s, friction FF zero zone in teaching
+    std::array<JointCalibParams, ARM_DOF> joints{};
+  };
+  std::string calib_file_;
+  CalibParams calib_;
+  bool friction_comp_enabled_ = false;
+  std::vector<double> friction_torques_;
+  // Per-joint output-side torque caps for τ_ff clamping (matches
+  // MOTOR_LIMIT_PARAMS tMax in openarm_can)
+  const std::array<double, ARM_DOF> kTMax_ = {54.0, 54.0, 28.0, 28.0,
+                                              10.0, 10.0, 10.0};
   // URDF position limits (per joint, already including bimanual offsets).
   // Used as soft limits in teaching mode: in teaching there is no trajectory
   // controller constraining motion, so the arm must not be dragged past them.
@@ -176,6 +206,8 @@ class OpenArm_v10HW : public hardware_interface::SystemInterface {
   void generate_joint_names();
   bool init_pinocchio_model();
   void compute_gravity_torques();
+  bool parse_calib_file(const std::string& path, CalibParams& out);
+  void compute_friction_ff();
   bool load_joint_limits();
 
   // Gripper mapping functions
