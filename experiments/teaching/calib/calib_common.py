@@ -153,7 +153,10 @@ class CalibSafety:
             self.trip(f"speed {max(abs(v) for v in dq):.2f} > {self.max_dq}")
             return False
         for i in range(7):
-            if q[i] < self.q_lower[i] or q[i] > self.q_upper[i]:
+            # 0.01 rad deadband: J4's lower limit equals the zero position and
+            # position-readout noise dips to -1e-4 — same tolerance as the
+            # hardware-layer teaching limit check
+            if q[i] < self.q_lower[i] - 0.01 or q[i] > self.q_upper[i] + 0.01:
                 self.trip(f"joint{i+1} q={q[i]:.3f} outside limits")
                 return False
         return True

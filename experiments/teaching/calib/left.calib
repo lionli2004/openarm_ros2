@@ -1,0 +1,13 @@
+# OpenArm calib — right_  2026-08-04
+# Mixed strategy: J1/J2/J5/J6/J7 use conservative (halved) tau_c from the
+# safe run; J3/J4 keep full tau_c (symmetric ±, so assist is equal in both
+# directions). teach_scale 0.5: J4 assist 0.72 Nm < static friction ~1.1 Nm.
+grav_k   1.0376 1.1025 1.0000 1.0391 1.0000 1.0679 0.8284
+tau_c_plus  0.103 0.000 0.150 1.448 0.059 0.128 0.251
+tau_c_minus -0.528 -0.740 -0.150 1.448 -0.031 -0.027 0.000
+b_plus      0.000 0.000 0.000 0.000 0.000 0.000 0.000
+b_minus     0.000 0.000 0.000 0.000 0.000 0.000 0.000
+eps         0.01 0.01 0.02 0.02 0.01 0.01 0.01
+fric_scale   0.50
+teach_scale  0.50
+teach_deadzone 0.03

@@ -85,7 +85,7 @@ def main():
     if not args.dry_run:
         input("press Enter when the arm area is clear...")
 
-    if not traj.wait():
+    if not args.dry_run and not traj.wait():
         print("ERROR: trajectory controller action not available")
         return 1
 

@@ -39,10 +39,14 @@ SPEEDS = {  # rad/s per joint group
     "fast": [0.05, 0.10, 0.20, 0.40],   # J1/J2 DM8009
     "slow": [0.02, 0.05, 0.10, 0.20],   # J3-J7
 }
-# calibration pose q* per joint (rest of the arm at zero)
+# calibration pose q* per joint (rest of the arm at zero), per arm
 # NOTE J6 (index 5): real mechanics hit the central column beyond ±0.2 rad,
 # so its pose is 0.1 (URDF limit ±0.785 is not achievable on the rig)
-CALIB_POSES = [0.3, 0.6, 0.4, 1.2, 0.4, 0.1, 0.4]
+# NOTE J2 left: usable range [-3.316, +0.175] (only +10° positive) → use -0.6
+CALIB_POSES = {
+    "right_": [0.3, 0.6, 0.4, 1.2, 0.4, 0.1, 0.4],
+    "left_": [0.3, -0.6, 0.4, 1.2, 0.4, 0.1, 0.4],
+}
 RAMP_RATE = 0.5   # Nm/s breakaway ramp
 RAMP_CAP = 15.0   # Nm
 FIRST_MOVE = 0.01  # rad/s
@@ -94,7 +98,7 @@ def main():
     if not args.dry_run:
         input("press Enter when clear...")
 
-    if not traj.wait():
+    if not args.dry_run and not traj.wait():
         print("ERROR: trajectory controller action not available")
         return 1
 
@@ -122,10 +126,10 @@ def main():
         for j in joints_to_scan:
             if args.dry_run:
                 print(f"J{j+1}: speeds={SPEEDS['slow' if j >= 2 else 'fast']} "
-                      f"q*={CALIB_POSES[j]}")
+                      f"q*={CALIB_POSES[args.arm][j]}")
                 continue
             speeds = SPEEDS["slow" if j >= 2 else "fast"]
-            q_star = CALIB_POSES[j]
+            q_star = CALIB_POSES[args.arm][j]
             print(f"--- J{j+1} (q*={q_star}, speeds={speeds}) ---")
 
             # ---- breakaway τ_s ----
