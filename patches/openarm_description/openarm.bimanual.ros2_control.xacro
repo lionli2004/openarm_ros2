@@ -12,7 +12,9 @@
              right_arm_prefix:=^|right_
              can_fd:=^|true
              teaching_mode:=^|false
-             teaching_gain_scale:=^|0.1">
+             teaching_gain_scale:=^|0.1
+             left_calib_file:=^|
+             right_calib_file:=^|">
 
     <!-- Left Arm Hardware Interface -->
     <ros2_control name="openarm_left_hardware_interface" type="system">
@@ -31,6 +33,7 @@
             <param name="can_fd">${can_fd}</param>
             <param name="teaching_mode">${teaching_mode}</param>
             <param name="teaching_gain_scale">${teaching_gain_scale}</param>
+            <param name="calib_file">${left_calib_file}</param>
           </xacro:unless>
         </hardware>
 
@@ -84,6 +87,7 @@
             <param name="can_fd">${can_fd}</param>
             <param name="teaching_mode">${teaching_mode}</param>
             <param name="teaching_gain_scale">${teaching_gain_scale}</param>
+            <param name="calib_file">${right_calib_file}</param>
           </xacro:unless>
         </hardware>
 

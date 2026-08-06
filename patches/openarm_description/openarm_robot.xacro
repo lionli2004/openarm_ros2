@@ -37,6 +37,8 @@
             right_arm_prefix:='right_'
             teaching_mode:=false
             teaching_gain_scale:=0.1
+            left_calib_file:=''
+            right_calib_file:=''
             "
             >
 
@@ -111,7 +113,9 @@
             right_arm_prefix="${right_arm_prefix}"
             hand="${hand}"
             teaching_mode="${teaching_mode}"
-            teaching_gain_scale="${teaching_gain_scale}"/>
+            teaching_gain_scale="${teaching_gain_scale}"
+            left_calib_file="${left_calib_file}"
+            right_calib_file="${right_calib_file}"/>
         </xacro:if>
 
         <xacro:if value="$(eval hand and ee_type == 'openarm_hand')">

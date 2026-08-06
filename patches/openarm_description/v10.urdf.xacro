@@ -43,6 +43,10 @@
 
   <xacro:arg name="teaching_gain_scale" default="0.1" />
 
+  <xacro:arg name="left_calib_file" default="" />
+
+  <xacro:arg name="right_calib_file" default="" />
+
   <xacro:arg name="bimanual" default="false" />
 
   <xacro:arg name="right_arm_base_xyz" default="0.0 -0.031 0.698" />
@@ -75,6 +79,8 @@
   fake_sensor_commands="$(arg fake_sensor_commands)"
   teaching_mode="$(arg teaching_mode)"
   teaching_gain_scale="$(arg teaching_gain_scale)"
+  left_calib_file="$(arg left_calib_file)"
+  right_calib_file="$(arg right_calib_file)"
   no_prefix="$(arg no_prefix)"
   arm_prefix=""
   body_prefix=""
